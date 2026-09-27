@@ -18,6 +18,21 @@ const OUTPUT_DIR = "output";
 const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
 const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
 
+// STAGE 5
+const ADD_BROKEN_URL = false;
+const BROKEN_URL = "https://books.toscrape.com/catalogue/this-book-does-not-exist_9999/index.html";
+const REPORT_FILE = path.join(OUTPUT_DIR, "run-report.json");
+
+const stats = {
+  pagesFetched: 0,    
+  cacheHits: 0,      
+  validRecords: 0,
+  invalidRecords: 0,
+  failedPages: 0,
+  failedUrls: [],     
+};
+
+
 let lastFetchTime = 0;
 
 function sleep(ms) {
@@ -46,7 +61,22 @@ function cacheFileFor(url) {
   const safe = url.replace(/^https?:\/\//, "").replace(/[^a-z0-9.-]/gi, "_");
   return path.join(CACHE_DIR, safe + ".html");
 }
-
+async function tryFetch(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+      signal: controller.signal,
+    });
+    return res;
+  } catch (err) {
+    
+    return { status: 0 };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function getPage(url) {
 
@@ -54,6 +84,7 @@ async function getPage(url) {
 
   if (fs.existsSync(cacheFile)) {
     const html = fs.readFileSync(cacheFile, "utf8");
+    stats.cacheHits++;
     console.log(`CACHE HIT  ${url}`);
     return html;
   }
@@ -61,28 +92,22 @@ async function getPage(url) {
   await waitBetweenFetches();
   console.log(`FETCH      ${url}`);
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-  let response;
-  try {
-    response = await fetch(url, {
-      headers: { "User-Agent": USER_AGENT },
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
+  let response = await tryFetch(url);;
+  const retryable = response.status === 0 || response.status >= 500;
+  if (retryable) {
+    console.log(`RETRY      ${url}  (status ${response.status})`);
+    await sleep(1000);
+    response = await tryFetch(url);
   }
-
   if (response.status !== 200) {
-    throw new Error(`Bad status ${response.status} for ${url}`);
+    throw new Error(`Bad response ${response.status} for ${url}`);
   }
 
   const html = await response.text();
   fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
   fs.writeFileSync(cacheFile, html);
+  stats.pagesFetched++;
   console.log(`SAVED      ${cacheFile}`);
-
   return html;
 }
 
@@ -137,6 +162,10 @@ async function collectBookLinks() {
   console.log(`catalogue_pages=${cataloguePages}`);
   console.log(`discovered=${all.length}`);
   console.log(`unique_urls=${unique.length}`);
+
+  if (ADD_BROKEN_URL) {
+    unique.push({ url: BROKEN_URL, sourcePage: START_URL });
+  }
 
   return unique;
 }
@@ -243,13 +272,40 @@ function writeOutput(good, bad) {
   console.log(`wrote ${ERRORS_FILE}`);
 }
 
+function writeRunReport(startedAt) {
+  const finishedAt = new Date();
+  const durationSeconds = (finishedAt - startedAt) / 1000;
+
+  const report = {
+    started_at: startedAt.toISOString(),
+    finished_at: finishedAt.toISOString(),
+    duration_seconds: Number(durationSeconds.toFixed(2)),
+    pages_fetched: stats.pagesFetched,
+    cache_hits: stats.cacheHits,
+    valid_records: stats.validRecords,
+    invalid_records: stats.invalidRecords,
+    failed_pages: stats.failedPages,
+    failed_urls: stats.failedUrls,
+  };
+
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  fs.writeFileSync(REPORT_FILE, JSON.stringify(report, null, 2));
+  console.log(`wrote ${REPORT_FILE}`);
+}
+
 async function fetchAllBooks(books) {
   const records = [];
 
   for (const book of books) {
+    try{
     const html = await getPage(book.url);
     const record = extractBook(html, book.url, book.sourcePage);
     records.push(record);
+    }catch(err){
+      stats.failedPages++;
+      stats.failedUrls.push({ url: book.url, reason: err.message });
+      console.log(`FAILED     ${book.url}  (${err.message})`);
+    }
   }
 
   return records;
@@ -257,12 +313,18 @@ async function fetchAllBooks(books) {
 
 // ----------- MAIN --------------- //
 async function main() {
+  const startedAt = new Date();
+
   const books = await collectBookLinks();
   const rawRecords = await fetchAllBooks(books);
   const cleanRecords = rawRecords.map(cleanRecord);
 
   const { good, bad } = validateRecords(cleanRecords);
+  stats.validRecords = good.length;
+  stats.invalidRecords = bad.length;
+
   writeOutput(good, bad);
+  writeRunReport(startedAt);
 
   console.log("");
   console.log("--- one clean record ---");
