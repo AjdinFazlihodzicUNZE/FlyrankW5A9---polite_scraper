@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import * as cheerio from "cheerio";
+import { z } from "zod";
 const START_URL =
   "https://books.toscrape.com/catalogue/page-1.html";
 
@@ -11,6 +12,11 @@ const TIMEOUT_MS = 10000;
 const DELAY_MS = 500;
 const MAX_PAGES = 3;
 const CACHE_DIR = "cache";
+
+ // FOR ZOD PART ON STEP 4
+const OUTPUT_DIR = "output";
+const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
+const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
 
 let lastFetchTime = 0;
 
@@ -162,6 +168,80 @@ function extractBook(html, bookUrl, sourcePage) {
     fetched_at: fetchedAt,
   };
 }
+function priceToNumber(priceText) {
+
+  const cleaned = priceText.replace(/[^0-9.]/g, "");
+  if (cleaned === "") return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function absoluteUrl(url) {
+
+  const u = new URL(url);
+  return u.toString();
+}
+
+function cleanRecord(raw) {
+
+  const priceGbp = priceToNumber(raw.price_text);
+
+  return {
+
+    product_url: absoluteUrl(raw.product_url),
+
+    title: raw.title,
+    price_text: raw.price_text,
+    availability_text: raw.availability_text,
+    rating_text: raw.rating_text,
+    description: raw.description,
+
+    price_gbp: priceGbp,
+
+    source_page: raw.source_page,
+    fetched_at: raw.fetched_at,
+  };
+}
+const BookSchema = z.object({
+  product_url: z.string().url().startsWith("https://"),
+  title: z.string().min(1),
+  price_text: z.string().min(1),
+  availability_text: z.string().min(1),
+  rating_text: z.string().min(1),
+  description: z.string().nullable(),   
+  price_gbp: z.number().nonnegative(),  
+  source_page: z.string().url().startsWith("https://"),
+  fetched_at: z.string().min(1),
+});
+function validateRecords(records) {
+  const good = [];
+  const bad = [];
+
+  for (const rec of records) {
+    const result = BookSchema.safeParse(rec);
+    if (result.success) {
+      good.push(result.data);
+    } else {
+      bad.push({
+        record: rec,
+        reason: result.error.issues.map((i) => i.message).join("; "),
+      });
+    }
+  }
+
+  return { good, bad };
+}
+function writeOutput(good, bad) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+  fs.writeFileSync(BOOKS_FILE, JSON.stringify(good, null, 2));
+  fs.writeFileSync(ERRORS_FILE, JSON.stringify(bad, null, 2));
+
+  console.log(`valid_records=${good.length}`);
+  console.log(`invalid_records=${bad.length}`);
+  console.log(`wrote ${BOOKS_FILE}`);
+  console.log(`wrote ${ERRORS_FILE}`);
+}
 
 async function fetchAllBooks(books) {
   const records = [];
@@ -178,13 +258,15 @@ async function fetchAllBooks(books) {
 // ----------- MAIN --------------- //
 async function main() {
   const books = await collectBookLinks();
-  const records = await fetchAllBooks(books);
+  const rawRecords = await fetchAllBooks(books);
+  const cleanRecords = rawRecords.map(cleanRecord);
+
+  const { good, bad } = validateRecords(cleanRecords);
+  writeOutput(good, bad);
 
   console.log("");
-  console.log("--- one complete raw record ---");
-  console.log(JSON.stringify(records[0], null, 2));
-  console.log("");
-  console.log(`detail_pages=${records.length}`);
+  console.log("--- one clean record ---");
+  console.log(JSON.stringify(good[0], null, 2));
 }
 
 main().catch((err) => {
