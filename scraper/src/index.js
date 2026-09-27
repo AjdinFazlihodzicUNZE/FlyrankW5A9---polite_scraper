@@ -32,6 +32,10 @@ function cacheFileFor(url) {
   if (m) {
     return path.join(CACHE_DIR, `catalogue-page-${m[1]}.html`);
   }
+  const b = url.match(/\/catalogue\/([^/]+)\/index\.html$/);
+  if (b) {
+    return path.join(CACHE_DIR, "books", `${b[1]}.html`);
+  }
 
   const safe = url.replace(/^https?:\/\//, "").replace(/[^a-z0-9.-]/gi, "_");
   return path.join(CACHE_DIR, safe + ".html");
@@ -69,7 +73,7 @@ async function getPage(url) {
   }
 
   const html = await response.text();
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
   fs.writeFileSync(cacheFile, html);
   console.log(`SAVED      ${cacheFile}`);
 
@@ -83,8 +87,10 @@ function findBookLinks(html, pageUrl) {
   $("article.product_pod h3 a").each((_, el) => {
     const href = $(el).attr("href");
     if (href) {
-      
-      links.push(new URL(href, pageUrl).toString());
+      links.push({
+        url: new URL(href, pageUrl).toString(),
+        sourcePage: pageUrl,
+      });
     }
   });
 
@@ -98,36 +104,87 @@ function findNextLink(html, pageUrl) {
   return new URL(href, pageUrl).toString();
 }
 
-async function collectBookUrls() {
+async function collectBookLinks() {
   let pageUrl = START_URL;
   let cataloguePages = 0;
-  const allLinks = [];
+  const all = [];
 
   while (cataloguePages < MAX_PAGES) {
     const html = await getPage(pageUrl);
     cataloguePages++;
 
-    const onThisPage = findBookLinks(html, pageUrl);
-    allLinks.push(...onThisPage);
+    all.push(...findBookLinks(html, pageUrl));
 
     const next = findNextLink(html, pageUrl);
-    if (!next) break;             // no more pages
+    if (!next) break;
     pageUrl = next;
   }
 
-  const uniqueUrls = [...new Set(allLinks)];
-
+  const seen = new Set();
+  const unique = [];
+  for (const item of all) {
+    if (!seen.has(item.url)) {
+      seen.add(item.url);
+      unique.push(item);
+    }
+  }
   console.log(`catalogue_pages=${cataloguePages}`);
-  console.log(`discovered=${allLinks.length}`);
-  console.log(`unique_urls=${uniqueUrls.length}`);
+  console.log(`discovered=${all.length}`);
+  console.log(`unique_urls=${unique.length}`);
 
-  return uniqueUrls;
+  return unique;
+}
+function extractBook(html, bookUrl, sourcePage) {
+  const $ = cheerio.load(html);
+
+  const title = $(".product_main h1").text().trim();
+
+  const priceText = $(".product_main .price_color").first().text().trim();
+
+  const availabilityText = $(".product_main .availability").first().text().trim();
+
+  const ratingClass = $(".product_main .star-rating").first().attr("class") || "";
+  const ratingText = ratingClass.replace("star-rating", "").trim();
+
+  const descEl = $("#product_description").next("p");
+  const description = descEl.length ? descEl.text().trim() : null;
+
+  const fetchedAt = new Date().toISOString();
+
+  return {
+    title: title,
+    product_url: bookUrl,
+    price_text: priceText,
+    availability_text: availabilityText,
+    rating_text: ratingText,
+    description: description,
+    source_page: sourcePage,
+    fetched_at: fetchedAt,
+  };
 }
 
+async function fetchAllBooks(books) {
+  const records = [];
+
+  for (const book of books) {
+    const html = await getPage(book.url);
+    const record = extractBook(html, book.url, book.sourcePage);
+    records.push(record);
+  }
+
+  return records;
+}
 
 // ----------- MAIN --------------- //
 async function main() {
-  await collectBookUrls();
+  const books = await collectBookLinks();
+  const records = await fetchAllBooks(books);
+
+  console.log("");
+  console.log("--- one complete raw record ---");
+  console.log(JSON.stringify(records[0], null, 2));
+  console.log("");
+  console.log(`detail_pages=${records.length}`);
 }
 
 main().catch((err) => {
